@@ -2,6 +2,10 @@
 
 FileMgr 是一个基于 **Tauri 2 + Vue 3** 的桌面文件管理器，目标是在 Windows 平台上提供轻量、流畅又现代的文件浏览体验。
 
+## 源码发布范围
+
+本仓库以“**仅后端**”形式发布（Rust 后端 + Tauri 壳工程）。前端源码与 Node/Vite 工程文件为有意不包含。
+
 ## 功能特性
 
 - 多标签页文件浏览，支持在同一窗口中打开多个路径  
@@ -20,40 +24,38 @@ FileMgr 是一个基于 **Tauri 2 + Vue 3** 的桌面文件管理器，目标是
 ## 运行环境
 
 - 操作系统：Windows 10/11（桌面环境）  
-- Node.js：建议 18+  
-- 包管理：npm（仓库内已包含 `package-lock.json`）  
+- Rust：stable 工具链（用于构建 `rust-backend/` 与 `src-tauri/`）  
+- Node.js：建议 18+（仅在你本地拥有前端源码时需要）  
 
-## 前端开发命令
+## 后端开发（Rust）
 
-在项目根目录 `e:\FileMgr` 下执行：
+构建：
 
 ```bash
-npm install
+cd rust-backend
+cargo build
 ```
 
-### 仅运行前端（浏览器预览）
+运行（如果后端工程提供可运行二进制）：
 
 ```bash
-npm run web:dev
+cd rust-backend
+cargo run
 ```
 
-构建前端静态资源：
+测试：
 
 ```bash
-npm run web:build
-```
-
-预览构建结果：
-
-```bash
-npm run web:preview
+cd rust-backend
+cargo test
 ```
 
 ## 桌面应用（Tauri）开发与构建
 
-启动 Tauri 开发模式（会同时启动前端和桌面壳）：
+桌面应用依赖前端资源。如果你本地拥有前端源码，可在仓库根目录执行：
 
 ```bash
+npm install
 npm run dev
 ```
 
@@ -67,20 +69,15 @@ npm run build
 
 ## 目录结构概览
 
-- `src/`  
-  - `App.vue`：主界面与应用逻辑入口  
-  - `main.js`：前端启动入口  
-  - `app/`：应用内部模块（如上下文菜单、侧边栏等）  
-- `dist/`：前端构建输出目录  
 - `rust-backend/`：Rust 后端工程（文件操作等逻辑）  
-- `src-tauri/`（如存在）：Tauri 配置与壳工程  
-- `package.json`：前端依赖与 npm 脚本  
-- `Cargo.toml`：Rust 后端依赖与构建配置  
+- `src-tauri/`：Tauri 配置与壳工程  
+- `LICENSE`：Apache License 2.0  
+
+前端源码（如 `src/`、`package.json`、`vite.config.js`、`dist/`）不包含在本仓库中。
 
 （实际内容可能会随版本演进略有变化）
 
 ## 许可证
 
-本项目在 [LICENSE](./LICENSE) 中声明的 **GNU General Public License v3.0 (GPL-3.0)** 下发布。  
-你可以在遵守该许可证条款的前提下自由使用、修改和分发本项目。
+本项目在 [LICENSE](./LICENSE) 中声明的 **Apache License 2.0** 下发布。
 

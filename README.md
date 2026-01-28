@@ -10,6 +10,10 @@
 
 FileMgr is a desktop file manager built with **Tauri 2** and **Vue 3**, aiming to provide a lightweight, smooth, and modern file browsing experience on Windows.
 
+## Source Availability
+
+This repository is published as **backend-only** (Rust backend + Tauri shell). Frontend sources and Node/Vite project files are intentionally not included.
+
 ## Features
 
 - Multi‑tab file browsing, allowing multiple locations in one window  
@@ -28,46 +32,42 @@ FileMgr is a desktop file manager built with **Tauri 2** and **Vue 3**, aiming t
 ## Requirements
 
 - OS: Windows 10/11 (desktop)  
-- Node.js: 18+ recommended  
-- Package manager: npm (a `package-lock.json` is included)  
+- Rust: stable toolchain (for building `rust-backend/` and `src-tauri/`)  
+- Node.js: 18+ (only required when you have the frontend sources locally)  
 
-## Frontend Commands
+## Backend Development (Rust)
 
-Run the following in the project root `e:\FileMgr`:
+Build:
 
 ```bash
-npm install
+cd rust-backend
+cargo build
 ```
 
-### Dev server (web only)
-
-Start the Vite dev server:
+Run (if the backend crate provides a runnable binary):
 
 ```bash
-npm run web:dev
+cd rust-backend
+cargo run
 ```
 
-Build static frontend assets:
+Test:
 
 ```bash
-npm run web:build
-```
-
-Preview the built bundle:
-
-```bash
-npm run web:preview
+cd rust-backend
+cargo test
 ```
 
 ## Desktop App (Tauri) Dev & Build
 
-Start Tauri dev mode (launches both frontend and desktop shell):
+The desktop app requires frontend assets. If you have the frontend sources locally, run in the repository root:
 
 ```bash
+npm install
 npm run dev
 ```
 
-Create a production build/installer:
+Production build/installer:
 
 ```bash
 npm run build
@@ -77,20 +77,15 @@ npm run build
 
 ## Project Structure (Overview)
 
-- `src/`  
-  - `App.vue`: Main UI and application logic  
-  - `main.js`: Frontend entry point  
-  - `app/`: Internal modules (context menu, sidebar navigation, etc.)  
-- `dist/`: Built frontend assets  
 - `rust-backend/`: Rust backend crate (filesystem and related logic)  
-- `src-tauri/` (if present): Tauri configuration and shell project  
-- `package.json`: Frontend dependencies and npm scripts  
-- `Cargo.toml`: Rust backend dependencies and build configuration  
+- `src-tauri/`: Tauri configuration and shell project  
+- `LICENSE`: Apache License 2.0  
+
+Frontend sources (e.g. `src/`, `package.json`, `vite.config.js`, `dist/`) are not included in this repository.
 
 Actual layout may evolve as the project grows.
 
 ## License
 
-This project is released under the **GNU General Public License v3.0 (GPL‑3.0)** as stated in [LICENSE](./LICENSE).  
-You are free to use, modify, and redistribute it under the terms of that license.
+This project is released under the **Apache License 2.0** as stated in [LICENSE](./LICENSE).
 
