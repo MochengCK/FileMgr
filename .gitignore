@@ -1,0 +1,38 @@
+############################
+# 只上传后端：根目录白名单策略
+############################
+
+# 根目录默认全部忽略，仅放行后端目录与必要元文件
+/*
+!/rust-backend/
+!/src-tauri/
+!/.gitignore
+!/.gitattributes
+!/LICENSE
+!/README.md
+!/README-zh_CN.md
+
+############################
+# 后端构建产物（避免 GitHub 体积/单文件限制）
+############################
+
+# Rust
+**/target/
+
+# Tauri
+/src-tauri/bin/
+/src-tauri/.tauri/
+/src-tauri/node_modules/
+
+# .NET native-menu
+/src-tauri/native-menu/bin/
+/src-tauri/native-menu/obj/
+
+# IDE / OS
+/.vscode/
+**/*.user
+**/*.suo
+**/*.cache
+**/*.log
+.DS_Store
+Thumbs.db

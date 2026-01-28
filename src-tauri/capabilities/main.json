@@ -1,0 +1,28 @@
+{
+  "identifier": "main",
+  "description": "main window capability",
+  "windows": ["main", "tab_*", "ctxmenu_*"],
+  "permissions": [
+    "core:default",
+    "core:menu:default",
+    "core:window:allow-create",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-close",
+    "core:window:allow-inner-position",
+    "core:window:allow-scale-factor",
+    "core:window:allow-is-fullscreen",
+    "core:window:allow-current-monitor",
+    "core:window:allow-set-position",
+    "core:window:allow-set-size",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-set-simple-fullscreen",
+    "core:window:allow-set-focus",
+    "core:window:allow-set-effects",
+    "core:window:allow-theme",
+    "drag:default"
+  ]
+}
