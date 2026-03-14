@@ -7,7 +7,7 @@
 </div>
 
 <p align="center">
-  <img src="./screenshots/FileMgr.png" width="1100" alt="LinkCore Download Manager Logo" />
+  <img src="./screenshots/FileMgr.EN.png" width="1100" alt="LinkCore Download Manager Logo" />
 </p>
 
 # FileMgr
