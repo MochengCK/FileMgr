@@ -7,7 +7,6 @@ use std::{
     sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
 use tauri::{Emitter, Manager};
 use walkdir::WalkDir;
 #[cfg(target_os = "windows")]
@@ -48,6 +47,12 @@ static FOLDER_SIZE_LATEST_REQUEST_ID: OnceLock<Mutex<HashMap<String, u64>>> = On
 
 fn folder_size_latest_map() -> &'static Mutex<HashMap<String, u64>> {
     FOLDER_SIZE_LATEST_REQUEST_ID.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static DIR_STATS_LATEST_REQUEST_ID: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn dir_stats_latest_map() -> &'static Mutex<HashMap<String, u64>> {
+    DIR_STATS_LATEST_REQUEST_ID.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[cfg(windows)]
@@ -262,6 +267,34 @@ struct FolderSizeParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct DirStatsParams {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    show_hidden: bool,
+    #[serde(default)]
+    show_system: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirStatsStreamParams {
+    request_id: u64,
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    show_hidden: bool,
+    #[serde(default)]
+    show_system: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirStatsCancelParams {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SearchDirParams {
     base_path: String,
     query: String,
@@ -272,6 +305,8 @@ struct SearchDirParams {
     show_hidden: bool,
     #[serde(default)]
     show_system: bool,
+    #[serde(default)]
+    full_text: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,6 +317,13 @@ struct SetJumpListParams {
 #[derive(Debug, Deserialize)]
 struct GetIconParams {
     path: String,
+    #[serde(default)]
+    size: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetStockIconParams {
+    id: u32,
     #[serde(default)]
     size: Option<u32>,
 }
@@ -372,6 +414,25 @@ struct DirEntryItem {
     modified_ms: Option<u128>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct SearchResultItem {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: Option<u64>,
+    modified_ms: Option<u128>,
+    snippet: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DirStatsResult {
+    path: String,
+    items: u64,
+    files: u64,
+    folders: u64,
+    files_bytes: u64,
+}
+
 fn system_time_to_ms(t: SystemTime) -> Option<u128> {
     t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis())
 }
@@ -450,6 +511,390 @@ fn list_dir(params: ListDirParams) -> Result<Vec<DirEntryItem>, String> {
         });
     }
     Ok(items)
+}
+
+#[tauri::command]
+async fn dir_stats(params: DirStatsParams) -> Result<DirStatsResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = params.path.trim().to_string();
+        if p.is_empty() {
+            return Err("路径不能为空".to_string());
+        }
+        let base = PathBuf::from(&p);
+        let m = fs::metadata(&base).map_err(|e| e.to_string())?;
+        if !m.is_dir() {
+            return Err("不是文件夹".to_string());
+        }
+        let show_hidden = params.show_hidden;
+        let show_system = params.show_system;
+        let recursive = params.recursive;
+
+        let mut items: u64 = 0;
+        let mut files: u64 = 0;
+        let mut folders: u64 = 0;
+        let mut files_bytes: u64 = 0;
+
+        if !recursive {
+            for entry in fs::read_dir(&base).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let metadata = entry.metadata().ok();
+                #[cfg(windows)]
+                {
+                    let attrs = metadata.as_ref().map(|m| m.file_attributes()).unwrap_or(0);
+                    if (attrs & 0x400) != 0 {
+                        continue;
+                    }
+                    if !show_system && (attrs & 0x4) != 0 {
+                        continue;
+                    }
+                    if !show_hidden && (attrs & 0x2) != 0 {
+                        continue;
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if !show_hidden && file_name.starts_with('.') {
+                        continue;
+                    }
+                }
+                let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                items += 1;
+                if is_dir {
+                    folders += 1;
+                    continue;
+                }
+                files += 1;
+                if let Some(len) = metadata.as_ref().map(|m| if m.is_file() { Some(m.len()) } else { None }).flatten() {
+                    files_bytes = files_bytes.saturating_add(len);
+                }
+            }
+            return Ok(DirStatsResult {
+                path: p,
+                items,
+                files,
+                folders,
+                files_bytes,
+            });
+        }
+
+        #[cfg(windows)]
+        fn should_skip_entry(meta: Option<&std::fs::Metadata>, show_hidden: bool, show_system: bool) -> bool {
+            let attrs = meta.map(|m| m.file_attributes()).unwrap_or(0);
+            if (attrs & 0x400) != 0 {
+                return true;
+            }
+            if !show_system && (attrs & 0x4) != 0 {
+                return true;
+            }
+            if !show_hidden && (attrs & 0x2) != 0 {
+                return true;
+            }
+            false
+        }
+
+        let walker = WalkDir::new(&base)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                #[cfg(windows)]
+                {
+                    let meta = e.metadata().ok();
+                    if e.file_type().is_symlink() {
+                        return false;
+                    }
+                    return !should_skip_entry(meta.as_ref(), show_hidden, show_system);
+                }
+                #[cfg(not(windows))]
+                {
+                    let name = e.file_name().to_string_lossy();
+                    if !show_hidden && name.starts_with('.') {
+                        return false;
+                    }
+                    true
+                }
+            });
+
+        for entry in walker {
+            let entry = match entry {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if entry.file_type().is_symlink() {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            #[cfg(windows)]
+            {
+                if should_skip_entry(meta.as_ref(), show_hidden, show_system) {
+                    continue;
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let name = entry.file_name().to_string_lossy();
+                if !show_hidden && name.starts_with('.') {
+                    continue;
+                }
+            }
+
+            items += 1;
+            if entry.file_type().is_dir() {
+                folders += 1;
+                continue;
+            }
+            if entry.file_type().is_file() {
+                files += 1;
+                if let Some(len) = meta.as_ref().map(|m| m.len()) {
+                    files_bytes = files_bytes.saturating_add(len);
+                }
+            }
+        }
+
+        Ok(DirStatsResult {
+            path: p,
+            items,
+            files,
+            folders,
+            files_bytes,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(Serialize, Clone)]
+struct DirStatsProgressPayload {
+    request_id: u64,
+    path: String,
+    stats: DirStatsResult,
+    done: bool,
+}
+
+#[tauri::command]
+async fn dir_stats_cancel(params: DirStatsCancelParams) -> Result<(), String> {
+    let p = params.path.trim().to_string();
+    if p.is_empty() {
+        return Ok(());
+    }
+    let key = p.to_lowercase();
+    if let Ok(mut map) = dir_stats_latest_map().lock() {
+        map.insert(key, 0);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn dir_stats_stream(window: tauri::Window, params: DirStatsStreamParams) -> Result<DirStatsResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let rid = params.request_id;
+        if rid == 0 {
+            return Err("request_id 不能为空".to_string());
+        }
+        let p = params.path.trim().to_string();
+        if p.is_empty() {
+            return Err("路径不能为空".to_string());
+        }
+        let base = PathBuf::from(&p);
+        let m = fs::metadata(&base).map_err(|e| e.to_string())?;
+        if !m.is_dir() {
+            return Err("不是文件夹".to_string());
+        }
+        let show_hidden = params.show_hidden;
+        let show_system = params.show_system;
+        let recursive = params.recursive;
+
+        let key = p.to_lowercase();
+        if let Ok(mut map) = dir_stats_latest_map().lock() {
+            map.insert(key.clone(), rid);
+        }
+
+        let mut items: u64 = 0;
+        let mut files: u64 = 0;
+        let mut folders: u64 = 0;
+        let mut files_bytes: u64 = 0;
+
+        let emit = |done: bool,
+                    window: &tauri::Window,
+                    p: &str,
+                    rid: u64,
+                    items: u64,
+                    files: u64,
+                    folders: u64,
+                    files_bytes: u64| {
+            let _ = window.emit(
+                "dir_stats_progress",
+                DirStatsProgressPayload {
+                    request_id: rid,
+                    path: p.to_string(),
+                    stats: DirStatsResult {
+                        path: p.to_string(),
+                        items,
+                        files,
+                        folders,
+                        files_bytes,
+                    },
+                    done,
+                },
+            );
+        };
+
+        let is_cancelled = |key: &str, rid: u64| -> bool {
+            if let Ok(map) = dir_stats_latest_map().lock() {
+                return map.get(key).copied().unwrap_or(0) != rid;
+            }
+            false
+        };
+
+        if !recursive {
+            for entry in fs::read_dir(&base).map_err(|e| e.to_string())? {
+                if is_cancelled(&key, rid) {
+                    return Ok(DirStatsResult {
+                        path: p,
+                        items,
+                        files,
+                        folders,
+                        files_bytes,
+                    });
+                }
+                let entry = entry.map_err(|e| e.to_string())?;
+                let metadata = entry.metadata().ok();
+                #[cfg(windows)]
+                {
+                    let attrs = metadata.as_ref().map(|m| m.file_attributes()).unwrap_or(0);
+                    if (attrs & 0x400) != 0 {
+                        continue;
+                    }
+                    if !show_system && (attrs & 0x4) != 0 {
+                        continue;
+                    }
+                    if !show_hidden && (attrs & 0x2) != 0 {
+                        continue;
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if !show_hidden && file_name.starts_with('.') {
+                        continue;
+                    }
+                }
+                let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                items += 1;
+                if is_dir {
+                    folders += 1;
+                    continue;
+                }
+                files += 1;
+                if let Some(len) = metadata
+                    .as_ref()
+                    .map(|m| if m.is_file() { Some(m.len()) } else { None })
+                    .flatten()
+                {
+                    files_bytes = files_bytes.saturating_add(len);
+                }
+            }
+            emit(true, &window, &p, rid, items, files, folders, files_bytes);
+            return Ok(DirStatsResult {
+                path: p,
+                items,
+                files,
+                folders,
+                files_bytes,
+            });
+        }
+
+        #[cfg(windows)]
+        fn should_skip_meta(meta: &std::fs::Metadata, show_hidden: bool, show_system: bool) -> bool {
+            let attrs = meta.file_attributes();
+            if (attrs & 0x400) != 0 {
+                return true;
+            }
+            if !show_system && (attrs & 0x4) != 0 {
+                return true;
+            }
+            if !show_hidden && (attrs & 0x2) != 0 {
+                return true;
+            }
+            false
+        }
+
+        let mut last_emit = Instant::now();
+        let mut it = WalkDir::new(base).follow_links(false).into_iter();
+        while let Some(next) = it.next() {
+            if is_cancelled(&key, rid) {
+                return Ok(DirStatsResult {
+                    path: p,
+                    items,
+                    files,
+                    folders,
+                    files_bytes,
+                });
+            }
+            let entry = match next {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if entry.depth() == 0 {
+                continue;
+            }
+            let ft = entry.file_type();
+            if ft.is_symlink() {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            #[cfg(windows)]
+            {
+                if let Some(md) = meta.as_ref() {
+                    if should_skip_meta(md, show_hidden, show_system) {
+                        if ft.is_dir() {
+                            it.skip_current_dir();
+                        }
+                        continue;
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                if !show_hidden {
+                    let name = entry.file_name().to_string_lossy();
+                    if name.starts_with('.') {
+                        if ft.is_dir() {
+                            it.skip_current_dir();
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            items += 1;
+            if ft.is_dir() {
+                folders += 1;
+            } else if ft.is_file() {
+                files += 1;
+                if let Some(len) = meta.as_ref().map(|m| m.len()) {
+                    files_bytes = files_bytes.saturating_add(len);
+                }
+            }
+
+            if last_emit.elapsed() >= Duration::from_millis(200) {
+                emit(false, &window, &p, rid, items, files, folders, files_bytes);
+                last_emit = Instant::now();
+            }
+        }
+
+        emit(true, &window, &p, rid, items, files, folders, files_bytes);
+        Ok(DirStatsResult {
+            path: p,
+            items,
+            files,
+            folders,
+            files_bytes,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[derive(Serialize, Clone)]
@@ -758,20 +1203,22 @@ async fn folder_size_stream(window: tauri::Window, params: FolderSizeParams) -> 
 }
 
 #[tauri::command]
-async fn search_dir(window: tauri::Window, params: SearchDirParams) -> Result<Vec<DirEntryItem>, String> {
+async fn search_dir(window: tauri::Window, params: SearchDirParams) -> Result<Vec<SearchResultItem>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(windows)]
         let window_label = window.label().to_string();
-        let base = PathBuf::from(params.base_path);
+        let base_path = params.base_path.trim().to_string();
+        let base = PathBuf::from(&base_path);
         let q = params.query.trim().to_string();
         let q_lower = q.to_lowercase();
         if q.is_empty() {
-            return Ok(Vec::<DirEntryItem>::new());
+            return Ok(Vec::<SearchResultItem>::new());
         }
         let request_id = params.request_id;
         let scope = params.scope.trim().to_string();
         let show_hidden = params.show_hidden;
         let show_system = params.show_system;
+        let full_text = params.full_text;
         #[cfg(windows)]
         let cancel_key = if scope.is_empty() {
             window_label.clone()
@@ -790,7 +1237,7 @@ async fn search_dir(window: tauri::Window, params: SearchDirParams) -> Result<Ve
         #[derive(Serialize, Clone)]
         struct SearchResultBatchPayload {
             request_id: u64,
-            results: Vec<DirEntryItem>,
+            results: Vec<SearchResultItem>,
         }
 
         #[cfg(windows)]
@@ -802,10 +1249,128 @@ async fn search_dir(window: tauri::Window, params: SearchDirParams) -> Result<Ve
 
         let q_is_ascii = q_lower.is_ascii();
 
-        let mut batch: Vec<DirEntryItem> = Vec::new();
+        let mut batch: Vec<SearchResultItem> = Vec::new();
         let mut scanned: u64 = 0;
         let mut matched: u64 = 0;
         let mut last_emit = std::time::Instant::now();
+
+        fn clamp_snippet(s: &str, start: usize, end: usize) -> String {
+            let mut a = start.min(s.len());
+            let mut b = end.min(s.len());
+            while a > 0 && !s.is_char_boundary(a) {
+                a -= 1;
+            }
+            while b < s.len() && !s.is_char_boundary(b) {
+                b += 1;
+            }
+            let mut out = String::new();
+            if a > 0 {
+                out.push('…');
+            }
+            out.push_str(&s[a..b]);
+            if b < s.len() {
+                out.push('…');
+            }
+            out
+        }
+
+        fn normalize_snippet(s: String) -> String {
+            let compact = s
+                .replace('\r', " ")
+                .replace('\n', " ")
+                .replace('\t', " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            compact.trim().to_string()
+        }
+
+        fn should_skip_content_by_ext(path: &PathBuf) -> bool {
+            let ext = path
+                .extension()
+                .map(|x| x.to_string_lossy().to_string().to_lowercase())
+                .unwrap_or_default();
+            if ext.is_empty() {
+                return false;
+            }
+            matches!(
+                ext.as_str(),
+                "exe"
+                    | "dll"
+                    | "sys"
+                    | "msi"
+                    | "zip"
+                    | "rar"
+                    | "7z"
+                    | "gz"
+                    | "bz2"
+                    | "xz"
+                    | "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "bmp"
+                    | "webp"
+                    | "ico"
+                    | "pdf"
+                    | "mp3"
+                    | "wav"
+                    | "flac"
+                    | "mp4"
+                    | "mkv"
+                    | "mov"
+                    | "avi"
+                    | "wmv"
+            )
+        }
+
+        fn find_content_snippet(
+            path: &PathBuf,
+            q: &str,
+            q_lower: &str,
+            q_is_ascii: bool,
+        ) -> Option<String> {
+            const MAX_BYTES: u64 = 2 * 1024 * 1024;
+            let meta = fs::metadata(path).ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            if meta.len() > MAX_BYTES {
+                return None;
+            }
+            if should_skip_content_by_ext(path) {
+                return None;
+            }
+
+            let bytes = fs::read(path).ok()?;
+            if bytes.is_empty() {
+                return None;
+            }
+            let hay = String::from_utf8_lossy(&bytes);
+            if hay.is_empty() {
+                return None;
+            }
+
+            let pos = if q_is_ascii {
+                let low = hay.to_ascii_lowercase();
+                low.find(q_lower)
+            } else {
+                hay.find(q)
+            }?;
+
+            let q_len = q.len().max(1);
+            let start = pos.saturating_sub(48);
+            let end = (pos + q_len).saturating_add(96);
+            let snippet = clamp_snippet(&hay, start, end);
+            let snippet = normalize_snippet(snippet);
+            if snippet.is_empty() {
+                None
+            } else {
+                Some(snippet)
+            }
+        }
+
+        
         let walker = WalkDir::new(base).follow_links(false).into_iter().filter_entry(move |e| {
             if e.depth() == 0 {
                 return true;
@@ -868,7 +1433,7 @@ async fn search_dir(window: tauri::Window, params: SearchDirParams) -> Result<Ve
                                 map.remove(&cancel_key);
                             }
                         }
-                        return Ok(Vec::<DirEntryItem>::new());
+                        return Ok(Vec::<SearchResultItem>::new());
                     }
                 }
             }
@@ -897,9 +1462,6 @@ async fn search_dir(window: tauri::Window, params: SearchDirParams) -> Result<Ve
             } else {
                 name.to_lowercase().contains(&q_lower)
             };
-            if !name_match {
-                continue;
-            }
             let path = entry.path().to_string_lossy().to_string();
             if path.trim().is_empty() {
                 continue;
@@ -937,12 +1499,23 @@ async fn search_dir(window: tauri::Window, params: SearchDirParams) -> Result<Ve
                 .and_then(|m| m.modified().ok())
                 .and_then(system_time_to_ms);
 
-            let item = DirEntryItem {
+            let mut snippet: Option<String> = None;
+            if !name_match && full_text && !is_dir {
+                snippet = find_content_snippet(&entry.path().to_path_buf(), &q, &q_lower, q_is_ascii);
+                if snippet.is_none() {
+                    continue;
+                }
+            } else if !name_match {
+                continue;
+            }
+
+            let item = SearchResultItem {
                 name,
                 path,
                 is_dir,
                 size,
                 modified_ms,
+                snippet,
             };
             batch.push(item);
             matched = matched.saturating_add(1);
@@ -977,7 +1550,7 @@ async fn search_dir(window: tauri::Window, params: SearchDirParams) -> Result<Ve
                 map.remove(&cancel_key);
             }
         }
-        Ok(Vec::<DirEntryItem>::new())
+        Ok(Vec::<SearchResultItem>::new())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1972,6 +2545,37 @@ fn icon_png_base64_for_any_jumbo(path: &str, size: u32) -> io::Result<Option<Str
             flags,
         );
         if ret == 0 {
+            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+            let hr = SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None);
+            if hr.is_ok() && !pidl.is_null() {
+                let _pidl_guard = PidlGuard(pidl);
+                let mut info_pidl = SHFILEINFOW::default();
+                let flags_pidl = SHGFI_SYSICONINDEX | SHGFI_PIDL;
+                let ret_pidl = SHGetFileInfoW(
+                    PCWSTR(pidl as *const u16),
+                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                    Some(&mut info_pidl),
+                    std::mem::size_of::<SHFILEINFOW>() as u32,
+                    flags_pidl,
+                );
+                if ret_pidl != 0 {
+                    info = info_pidl;
+                } else {
+                    let mut info2 = SHFILEINFOW::default();
+                    let flags2 = SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES;
+                    let ret2 = SHGetFileInfoW(
+                        PCWSTR(wide.as_ptr()),
+                        FILE_ATTRIBUTE_NORMAL,
+                        Some(&mut info2),
+                        std::mem::size_of::<SHFILEINFOW>() as u32,
+                        flags2,
+                    );
+                    if ret2 == 0 {
+                        return Ok(None);
+                    }
+                    info = info2;
+                }
+            } else {
             let mut info2 = SHFILEINFOW::default();
             let flags2 = SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES;
             let ret2 = SHGetFileInfoW(
@@ -1985,6 +2589,7 @@ fn icon_png_base64_for_any_jumbo(path: &str, size: u32) -> io::Result<Option<Str
                 return Ok(None);
             }
             info = info2;
+            }
         }
 
         let list_kind: i32 = if size >= 96 { 4 } else if size >= 48 { 2 } else { 1 };
@@ -2054,6 +2659,24 @@ unsafe fn shell_item2_get_string(item: &IShellItem2, key: *const PROPERTYKEY) ->
 #[cfg(windows)]
 unsafe fn shell_item2_get_u64(item: &IShellItem2, key: *const PROPERTYKEY) -> Option<u64> {
     item.GetUInt64(key).ok()
+}
+
+#[cfg(windows)]
+unsafe fn shell_item2_get_u32(item: &IShellItem2, key: *const PROPERTYKEY) -> Option<u32> {
+    item.GetUInt32(key).ok()
+}
+
+#[cfg(windows)]
+fn property_key_from_name(name: &str) -> Option<PROPERTYKEY> {
+    unsafe {
+        let wide = to_wide_null(name);
+        let mut key = PROPERTYKEY::default();
+        if PSGetPropertyKeyFromName(PCWSTR(wide.as_ptr()), &mut key).is_ok() {
+            Some(key)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -2267,10 +2890,14 @@ fn list_roots_detailed() -> Result<Vec<RootItemDetailed>, String> {
 fn get_icon_png_base64(params: GetIconParams) -> Result<Option<String>, String> {
     #[cfg(windows)]
     {
-        let size = params.size.unwrap_or(16);
+        let size = params.size.unwrap_or(64);
         let path = params.path.trim().to_string();
         if is_dynamic_icon_path(&path) {
-            return icon_png_base64_for_any(&path, Some(size)).map_err(|e| e.to_string());
+            let effective_size = size.max(128);
+            if let Ok(Some(v)) = icon_png_base64_for_any_jumbo(&path, effective_size) {
+                    return Ok(Some(v));
+            }
+            return icon_png_base64_for_any(&path, Some(effective_size)).map_err(|e| e.to_string());
         }
         let key = IconCacheKey {
             path,
@@ -2281,11 +2908,59 @@ fn get_icon_png_base64(params: GetIconParams) -> Result<Option<String>, String> 
                 return Ok(v);
             }
         }
-        let v = icon_png_base64_for_any(&key.path, Some(size)).map_err(|e| e.to_string())?;
+        let v = if size >= 48 {
+            match icon_png_base64_for_any_jumbo(&key.path, size) {
+                Ok(Some(v)) => Some(v),
+                _ => icon_png_base64_for_any(&key.path, Some(size)).map_err(|e| e.to_string())?,
+            }
+        } else {
+            icon_png_base64_for_any(&key.path, Some(size)).map_err(|e| e.to_string())?
+        };
         if let Ok(mut cache) = icon_cache().lock() {
             cache.insert(key, v.clone());
         }
         return Ok(v);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = params;
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+fn get_stock_icon_png_base64(params: GetStockIconParams) -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::Shell::{
+            SHGetStockIconInfo, SHGSI_ICON, SHGSI_LARGEICON, SHGSI_SMALLICON, SHSTOCKICONID,
+            SHSTOCKICONINFO,
+        };
+
+        let size = params.size.unwrap_or(16);
+        let key = IconCacheKey {
+            path: format!("__stock_icon__:{:08x}", params.id),
+            size,
+        };
+        if let Ok(mut cache) = icon_cache().lock() {
+            if let Some(v) = cache.get(&key) {
+                return Ok(v);
+            }
+        }
+
+        let mut sii = SHSTOCKICONINFO::default();
+        sii.cbSize = std::mem::size_of::<SHSTOCKICONINFO>() as u32;
+        let flags = SHGSI_ICON | if size <= 16 { SHGSI_SMALLICON } else { SHGSI_LARGEICON };
+        let hr = SHGetStockIconInfo(SHSTOCKICONID(params.id as i32), flags, &mut sii);
+        let v = if hr.is_err() || sii.hIcon.0.is_null() {
+            None
+        } else {
+            icon_png_base64_from_hicon(sii.hIcon).map_err(|e| e.to_string())?
+        };
+        if let Ok(mut cache) = icon_cache().lock() {
+            cache.insert(key, v.clone());
+        }
+        Ok(v)
     }
     #[cfg(not(windows))]
     {
@@ -2391,6 +3066,26 @@ fn get_basic_file_info(params: GetBasicFileInfoParams) -> Result<BasicFileInfo, 
             size_bytes: None,
         })
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadTextFileParams {
+    path: String,
+}
+
+#[tauri::command]
+fn read_text_file(params: ReadTextFileParams) -> Result<String, String> {
+    let path = params.path.trim().to_string();
+    if path.is_empty() {
+        return Err("路径不能为空".to_string());
+    }
+    let pb = std::path::PathBuf::from(&path);
+    if !pb.is_file() {
+        return Err("不是有效的文件".to_string());
+    }
+    let content = std::fs::read_to_string(&pb).map_err(|e| e.to_string())?;
+    Ok(content)
 }
 
 #[tauri::command]
@@ -2527,7 +3222,7 @@ fn confirm_task_dialog(params: ConfirmTaskDialogParams) -> Result<bool, String> 
 fn get_icons_png_base64_batch(params: GetIconsBatchParams) -> Result<Vec<IconBatchItem>, String> {
     #[cfg(windows)]
     {
-        let size = params.size.unwrap_or(16);
+        let size = params.size.unwrap_or(64);
         let mut out: Vec<IconBatchItem> = Vec::new();
         for p in params.paths.into_iter().take(512) {
             let path = p.trim().to_string();
@@ -2535,7 +3230,11 @@ fn get_icons_png_base64_batch(params: GetIconsBatchParams) -> Result<Vec<IconBat
                 continue;
             }
             if is_dynamic_icon_path(&path) {
-                let icon_png_base64 = icon_png_base64_for_any(&path, Some(size)).ok().flatten();
+                let effective_size = size.max(128);
+                let icon_png_base64 = match icon_png_base64_for_any_jumbo(&path, effective_size) {
+                    Ok(Some(v)) => Some(v),
+                    _ => icon_png_base64_for_any(&path, Some(effective_size)).ok().flatten(),
+                };
                 out.push(IconBatchItem { path, icon_png_base64 });
                 continue;
             }
@@ -2554,7 +3253,14 @@ fn get_icons_png_base64_batch(params: GetIconsBatchParams) -> Result<Vec<IconBat
                 }
             }
 
-            let icon_png_base64 = icon_png_base64_for_any(&path, Some(size)).ok().flatten();
+            let icon_png_base64 = if size >= 48 {
+                match icon_png_base64_for_any_jumbo(&path, size) {
+                    Ok(Some(v)) => Some(v),
+                    _ => icon_png_base64_for_any(&path, Some(size)).ok().flatten(),
+                }
+            } else {
+                icon_png_base64_for_any(&path, Some(size)).ok().flatten()
+            };
 
             if let Ok(mut cache) = icon_cache().lock() {
                 cache.insert(key, icon_png_base64.clone());
@@ -2607,6 +3313,24 @@ struct GetThumbsBatchParams {
 struct ThumbBatchItem {
     path: String,
     thumb_png_base64: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetMediaMetadataParams {
+    path: String,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+struct MediaMetadata {
+    kind: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    duration_ms: Option<u64>,
+    frame_rate: Option<f64>,
+    video_bitrate: Option<u32>,
+    audio_bitrate: Option<u32>,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
 }
 
 #[cfg(windows)]
@@ -2748,6 +3472,18 @@ fn thumb_png_base64_for_shell(path: &str, size: u32) -> io::Result<Option<String
     if !pb.exists() {
         return Ok(None);
     }
+    
+    // 先检查缓存，避免重复生成
+    let key = ThumbCacheKey {
+        path: p.to_string(),
+        size,
+    };
+    if let Ok(mut cache) = thumb_cache().lock() {
+        if let Some(v) = cache.get(&key) {
+            return Ok(v.clone());
+        }
+    }
+    
     let size = size.clamp(24, 1024);
     let _com = com_init();
     unsafe {
@@ -2763,10 +3499,27 @@ fn thumb_png_base64_for_shell(path: &str, size: u32) -> io::Result<Option<String
             cx: size as i32,
             cy: size as i32,
         };
-        let flags = windows::Win32::UI::Shell::SIIGBF_BIGGERSIZEOK;
+        // 使用 SIIGBF_THUMBNAILONLY 优先使用缩略图缓存，速度更快
+        // 如果失败，回退到 SIIGBF_BIGGERSIZEOK
+        let flags = windows::Win32::UI::Shell::SIIGBF_THUMBNAILONLY;
         let hbitmap = factory.GetImage(sz, flags).ok();
+        let hbitmap = match hbitmap {
+            Some(bmp) => Some(bmp),
+            None => {
+                // 回退到默认方式
+                let flags = windows::Win32::UI::Shell::SIIGBF_BIGGERSIZEOK;
+                factory.GetImage(sz, flags).ok()
+            }
+        };
         match hbitmap {
-            Some(bmp) => png_base64_from_hbitmap(bmp),
+            Some(bmp) => {
+                let result = png_base64_from_hbitmap(bmp)?;
+                // 存入缓存
+                if let Ok(mut cache) = thumb_cache().lock() {
+                    cache.insert(key, result.clone());
+                }
+                Ok(result)
+            }
             None => Ok(None),
         }
     }
@@ -2815,44 +3568,172 @@ fn get_image_thumbs_png_base64_batch(params: GetThumbsBatchParams) -> Result<Vec
 }
 
 #[tauri::command]
-fn get_shell_thumbs_png_base64_batch(params: GetThumbsBatchParams) -> Result<Vec<ThumbBatchItem>, String> {
+async fn get_shell_thumbs_png_base64_batch(params: GetThumbsBatchParams) -> Result<Vec<ThumbBatchItem>, String> {
     #[cfg(windows)]
     {
+        use rayon::prelude::*;
+        
         let size = params.size.unwrap_or(256);
-        let mut out: Vec<ThumbBatchItem> = Vec::new();
-        for p in params.paths.into_iter().take(256) {
-            let path = p.trim().to_string();
-            if path.is_empty() {
-                continue;
-            }
-            let key = ThumbCacheKey {
-                path: path.clone(),
-                size,
-            };
-            if let Ok(mut cache) = thumb_cache().lock() {
-                if let Some(v) = cache.get(&key) {
-                    out.push(ThumbBatchItem {
+        let paths: Vec<String> = params.paths.into_iter().take(64).collect();
+        
+        // 使用 spawn_blocking 在后台线程执行缩略图生成，避免阻塞主线程
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            // 使用并行迭代器加速处理
+            let items: Vec<ThumbBatchItem> = paths
+                .par_iter()
+                .filter_map(|path| {
+                    let path = path.trim().to_string();
+                    if path.is_empty() {
+                        return None;
+                    }
+                    
+                    // 先检查缓存
+                    let key = ThumbCacheKey {
+                        path: path.clone(),
+                        size,
+                    };
+                    if let Ok(mut cache) = thumb_cache().lock() {
+                        if let Some(v) = cache.get(&key) {
+                            return Some(ThumbBatchItem {
+                                path,
+                                thumb_png_base64: v.clone(),
+                            });
+                        }
+                    }
+                    
+                    // 生成缩略图（带超时）
+                    let v = thumb_png_base64_for_shell(&path, size).ok().flatten();
+                    if let Ok(mut cache) = thumb_cache().lock() {
+                        cache.insert(key, v.clone());
+                    }
+                    
+                    Some(ThumbBatchItem {
                         path,
                         thumb_png_base64: v,
-                    });
-                    continue;
-                }
-            }
-            let v = thumb_png_base64_for_shell(&path, size).ok().flatten();
-            if let Ok(mut cache) = thumb_cache().lock() {
-                cache.insert(key, v.clone());
-            }
-            out.push(ThumbBatchItem {
-                path,
-                thumb_png_base64: v,
-            });
-        }
-        return Ok(out);
+                    })
+                })
+                .collect();
+            
+            items
+        }).await.map_err(|e| e.to_string())?;
+        
+        return Ok(result);
     }
     #[cfg(not(windows))]
     {
         let _ = params;
         Ok(vec![])
+    }
+}
+
+#[tauri::command]
+fn get_media_metadata(params: GetMediaMetadataParams) -> Result<MediaMetadata, String> {
+    #[cfg(windows)]
+    {
+        let path = params.path.trim().to_string();
+        if path.is_empty() {
+            return Ok(MediaMetadata::default());
+        }
+        if is_shell_like_path(&path) {
+            return Ok(MediaMetadata::default());
+        }
+        let pb = PathBuf::from(&path);
+        if !pb.is_file() {
+            return Ok(MediaMetadata::default());
+        }
+
+        let _com = com_init();
+        let mut out = MediaMetadata::default();
+
+        unsafe {
+            let item = match shell_item2_from_parsing_name(&path).map_err(|e| e.to_string())? {
+                Some(v) => v,
+                None => return Ok(out),
+            };
+
+            let img_w = property_key_from_name("System.Image.HorizontalSize")
+                .and_then(|k| shell_item2_get_u32(&item, &k))
+                .filter(|v| *v > 0);
+            let img_h = property_key_from_name("System.Image.VerticalSize")
+                .and_then(|k| shell_item2_get_u32(&item, &k))
+                .filter(|v| *v > 0);
+
+            let vid_w = property_key_from_name("System.Video.FrameWidth")
+                .and_then(|k| shell_item2_get_u32(&item, &k))
+                .filter(|v| *v > 0);
+            let vid_h = property_key_from_name("System.Video.FrameHeight")
+                .and_then(|k| shell_item2_get_u32(&item, &k))
+                .filter(|v| *v > 0);
+
+            let duration_100ns = property_key_from_name("System.Media.Duration")
+                .and_then(|k| shell_item2_get_u64(&item, &k))
+                .filter(|v| *v > 0);
+            if let Some(v) = duration_100ns {
+                out.duration_ms = Some(v / 10_000);
+            }
+
+            let frame_rate_raw = property_key_from_name("System.Video.FrameRate")
+                .and_then(|k| shell_item2_get_u32(&item, &k))
+                .filter(|v| *v > 0);
+            if let Some(v) = frame_rate_raw {
+                let fps = if v >= 1000 { (v as f64) / 1000.0 } else { v as f64 };
+                out.frame_rate = Some(fps);
+            }
+
+            out.video_bitrate = property_key_from_name("System.Video.EncodingBitrate")
+                .and_then(|k| shell_item2_get_u32(&item, &k))
+                .filter(|v| *v > 0);
+            out.audio_bitrate = property_key_from_name("System.Audio.EncodingBitrate")
+                .and_then(|k| shell_item2_get_u32(&item, &k))
+                .filter(|v| *v > 0);
+
+            out.video_codec = property_key_from_name("System.Video.Compression")
+                .and_then(|k| shell_item2_get_string(&item, &k))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            out.audio_codec = property_key_from_name("System.Audio.Format")
+                .and_then(|k| shell_item2_get_string(&item, &k))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let has_video = out.duration_ms.is_some()
+                || vid_w.is_some()
+                || vid_h.is_some()
+                || out.frame_rate.is_some()
+                || out.video_bitrate.is_some()
+                || out.audio_bitrate.is_some()
+                || out.video_codec.is_some()
+                || out.audio_codec.is_some();
+
+            if has_video {
+                out.kind = "video".to_string();
+                out.width = vid_w.or(img_w);
+                out.height = vid_h.or(img_h);
+            } else if img_w.is_some() || img_h.is_some() {
+                out.kind = "image".to_string();
+                out.width = img_w;
+                out.height = img_h;
+            }
+        }
+
+        if out.kind != "video" && (out.width.is_none() || out.height.is_none()) {
+            if let Ok(reader) = image::ImageReader::open(&pb).and_then(|r| r.with_guessed_format()) {
+                if let Ok((w, h)) = reader.into_dimensions() {
+                    if w > 0 && h > 0 {
+                        out.kind = "image".to_string();
+                        out.width = Some(w);
+                        out.height = Some(h);
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = params;
+        Ok(MediaMetadata::default())
     }
 }
 
@@ -3110,7 +3991,7 @@ fn get_drag_icon_path() -> Result<String, String> {
     let mut p = std::env::temp_dir();
     p.push("filemgr_drag_icon_256.png");
     if !p.exists() {
-        fs::write(&p, include_bytes!("../icons/128x128@2x.png")).map_err(|e| e.to_string())?;
+        fs::write(&p, include_bytes!("../../F.png")).map_err(|e| e.to_string())?;
     }
     Ok(p.to_string_lossy().to_string())
 }
@@ -5070,6 +5951,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_dir,
+            dir_stats,
+            dir_stats_stream,
+            dir_stats_cancel,
             folder_size,
             folder_size_stream,
             search_dir,
@@ -5082,6 +5966,7 @@ pub fn run() {
             show_quick_access_context_menu,
             list_roots_detailed,
             get_icon_png_base64,
+            get_stock_icon_png_base64,
             get_new_item_icon_png_base64,
             confirm_message_box,
             confirm_task_dialog,
@@ -5089,6 +5974,7 @@ pub fn run() {
             get_icons_png_base64_batch,
             get_image_thumbs_png_base64_batch,
             get_shell_thumbs_png_base64_batch,
+            get_media_metadata,
             list_shell_folder,
             scan_gallery_images,
             open_path,
@@ -5109,7 +5995,8 @@ pub fn run() {
             show_folder_background_context_menu,
             get_system_accent_color,
             set_window_effect,
-            set_window_corner_preference
+            set_window_corner_preference,
+            read_text_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

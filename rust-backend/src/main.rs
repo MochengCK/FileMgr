@@ -9,21 +9,19 @@ use std::{
 #[cfg(windows)]
 use base64::Engine as _;
 #[cfg(windows)]
+use windows::core::PCWSTR;
+#[cfg(windows)]
 use windows::Win32::{
     Graphics::Gdi::{
         CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, SelectObject, BITMAP,
         BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HGDIOBJ,
     },
-    Storage::FileSystem::{
-        GetDriveTypeW, GetVolumeInformationW, FILE_FLAGS_AND_ATTRIBUTES,
-    },
+    Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW, FILE_FLAGS_AND_ATTRIBUTES},
     UI::{
         Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON},
         WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO},
     },
 };
-#[cfg(windows)]
-use windows::core::PCWSTR;
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -93,7 +91,10 @@ fn list_dir(path: &str) -> io::Result<Vec<DirEntryItem>> {
         let full_path = entry.path();
         let metadata = entry.metadata().ok();
         let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-        let size = metadata.as_ref().map(|m| if m.is_file() { Some(m.len()) } else { None }).flatten();
+        let size = metadata
+            .as_ref()
+            .map(|m| if m.is_file() { Some(m.len()) } else { None })
+            .flatten();
         let modified_ms = metadata
             .as_ref()
             .and_then(|m| m.modified().ok())
@@ -156,7 +157,10 @@ fn hbitmap_to_rgba(hbmp: HBITMAP) -> io::Result<(u32, u32, Vec<u8>)> {
 
         let hdc = CreateCompatibleDC(None);
         if hdc.0.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "CreateCompatibleDC failed"));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "CreateCompatibleDC failed",
+            ));
         }
         let prev = SelectObject(hdc, HGDIOBJ(hbmp.0));
         let res = GetDIBits(
@@ -178,7 +182,11 @@ fn hbitmap_to_rgba(hbmp: HBITMAP) -> io::Result<(u32, u32, Vec<u8>)> {
         let mut rgba = vec![0u8; buf.len()];
         let row_len = bytes_per_row as usize;
         for y in 0..(abs_height as usize) {
-            let src_row = if height > 0 { abs_height as usize - 1 - y } else { y };
+            let src_row = if height > 0 {
+                abs_height as usize - 1 - y
+            } else {
+                y
+            };
             let src_off = src_row * row_len;
             let dst_off = y * row_len;
             for x in 0..width as usize {
@@ -285,7 +293,11 @@ fn drive_label_for_root(path: &str) -> String {
         )
         .is_ok()
     };
-    let vol_name = if ok { utf16_z_to_string(&vol) } else { String::new() };
+    let vol_name = if ok {
+        utf16_z_to_string(&vol)
+    } else {
+        String::new()
+    };
     if !vol_name.trim().is_empty() {
         return format!("{vol_name} ({letter}:)");
     }

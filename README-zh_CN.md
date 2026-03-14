@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./screenshots/FileMgr.png" width="1100" alt="LinkCore Download Manager Logo" />
+</p>
+
 # FileMgr
 
 FileMgr 是一个基于 **Tauri 2 + Vue 3** 的桌面文件管理器，目标是在 Windows 平台上提供轻量、流畅又现代的文件浏览体验。

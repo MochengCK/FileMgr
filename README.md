@@ -6,6 +6,10 @@
   </table>
 </div>
 
+<p align="center">
+  <img src="./screenshots/FileMgr.png" width="1100" alt="LinkCore Download Manager Logo" />
+</p>
+
 # FileMgr
 
 FileMgr is a desktop file manager built with **Tauri 2** and **Vue 3**, aiming to provide a lightweight, smooth, and modern file browsing experience on Windows.
